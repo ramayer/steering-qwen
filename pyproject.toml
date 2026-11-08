@@ -1,20 +1,35 @@
 [project]
 name = "steering-llms"
 version = "0.1.0"
-description = "Add your description here"
+description = "Steer Qwen3.5 by pushing single MLP neuron directions into the residual stream."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.15.0",
+    # 4-bit NF4 quantization; runs on CUDA, MPS and CPU.
     "bitsandbytes>=0.50.2",
-    "flash-linear-attention>=0.6.0",
+    # Triton kernels for Qwen3.5's linear-attention layers. Triton doesn't exist on macOS;
+    # there transformers falls back to its pure-PyTorch implementation.
+    "flash-linear-attention>=0.6.0; sys_platform != 'darwin'",
     "pillow>=13.0.0",
     "torch>=2.15.0",
     "torchvision>=0.29.2",
     "transformers>=5.22.1",
 ]
 
+[project.scripts]
+steer = "steering_llms.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [dependency-groups]
 dev = [
     "ipykernel>=7.4.0",
+    "jupyterlab",
+    "pytest",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
