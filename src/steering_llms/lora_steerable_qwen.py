@@ -1,8 +1,9 @@
+
 import torch, torch.nn as nn
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TextStreamer
-
+from huggingface_hub import snapshot_download
 
 # ---------- module-level helpers (no SteeredModel coupling) ----------
 
@@ -92,12 +93,19 @@ class ChatDataset(Dataset):
 class SteeredModel:
     def __init__(self, model_id="Qwen/Qwen3.5-4B", calib_prompts=None,
                  max_memory=None, dtype=torch.bfloat16):
-        self.tok = AutoTokenizer.from_pretrained(model_id)
+        
+        # Regarding cached files:
+        # https://share.google/aimode/fk6Osql9l52aauOlG
+        local_dir = snapshot_download(repo_id=model_id)
+        self.tok = AutoTokenizer.from_pretrained(local_dir,local_files_only=True)
         q = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
                                bnb_4bit_compute_dtype=dtype)
+
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_id, quantization_config=q, device_map="auto",
-            max_memory=max_memory or {0: "5GiB", "cpu": "16GiB"}, dtype=dtype)
+            local_dir, quantization_config=q, device_map="auto",
+            max_memory=max_memory or {0: "5GiB", "cpu": "16GiB"},
+            local_files_only=True,
+            dtype=dtype)
         self.layers, self.layer_path = self._find_layers()
         self.tweaks = {}          # layer -> LoRATweak
         self._med = {}
@@ -231,19 +239,47 @@ class SteeredModel:
         return self
 
     # ---- chat ----
-    def continue_chat(self, session, prompt, max_new_tokens=256, stream=True, **gen_kw):
-        session.append({"role": "user", "content": prompt})
-        ids = self.tok.apply_chat_template(
-            session, add_generation_prompt=True, return_tensors="pt",
-            return_dict=True, enable_thinking=False).to(self.model.device)
+    def continue_chat(self, session, prompt, 
+                      max_new_tokens=256, stream=True, 
+                      repetition_penalty=None,
+                      add_generation_prompt=True, enable_thinking=False,
+                      continue_final_message=False, debug_input=False,
+                      **gen_kw):
+        session = json.loads(json.dumps(session))
+        if prompt is not None:
+            session.append({"role": "user", "content": prompt})
+        else:
+            add_generation_prompt=False
+            continue_final_message=True
+            enable_thinking=False
+
+        input_txt = sm.tok.apply_chat_template(
+            session,
+            tokenize=False,             
+            add_generation_prompt=add_generation_prompt,
+            continue_final_message=continue_final_message,
+            enable_thinking=enable_thinking
+        )
+        ids = sm.tok(input_txt, return_tensors="pt", return_dict=True).to(self.model.device)
+        if debug_input:
+            print(input_txt)
         streamer = TextStreamer(self.tok, skip_prompt=True) if stream else None
-        out = self.model.generate(**ids, streamer=streamer,
+        outputs = self.model.generate(**ids, 
+                                  streamer=streamer,
                                   pad_token_id=self.tok.eos_token_id,
                                   max_new_tokens=max_new_tokens,
-                                  repetition_penalty=1.25, **gen_kw)
-        new = out[0, ids["input_ids"].shape[1]:]
-        session.append({"role": "assistant",
-                        "content": self.tok.decode(new, skip_special_tokens=False)})
+                                  repetition_penalty=repetition_penalty, 
+                                  **gen_kw
+                                  )
+        input_len = ids["input_ids"].shape[1]
+        new_tokens = outputs[0, input_len:]
+        if new_tokens[-1] in self.tok.all_special_ids and len(new_tokens)<=2:
+            print("### End reached",  self.tok.decode(new_tokens, skip_special_tokens=False))
+        new_text = self.tok.decode(new_tokens, skip_special_tokens=True)
+        if session[-1]['role'] == "assistant":
+            session[-1]["content"] += new_text
+        else:
+            session = session + [{"role": "assistant","content": new_text}]
         return session
 
     # ---- cleanup ----
@@ -251,3 +287,4 @@ class SteeredModel:
         for L, w in list(self.tweaks.items()):
             self.layers[L].mlp.down_proj = w.base
         self.tweaks.clear()
+
