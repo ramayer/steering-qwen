@@ -1,5 +1,6 @@
-
+import json
 import torch, torch.nn as nn
+import time
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TextStreamer
@@ -51,7 +52,7 @@ class LoRATweak(nn.Module):
         out = self.base(x)
         xa = x.to(self.A.dtype)
         lora = ((xa @ self.A.T) @ self.B.T) * self.lora_scale
-        return out + lora.to(out.dtype) + self.bias.to(out.dtype)
+        return out + lora.to(out.dtype) + self.bias.to(out.dtype) * self.lora_scale
 
     def trainable(self, mode="lora"):
         if mode == "lora": return [self.A, self.B]
@@ -63,20 +64,33 @@ class LoRATweak(nn.Module):
 # ---------- dataset ----------
 
 class ChatDataset(Dataset):
-    """conversations: list of [[role, text], ...]. Trains only on 'assistant' turns."""
-    def __init__(self, conversations, tok, max_len=256):
-        self.convs, self.tok, self.max_len = conversations, tok, max_len
+    """conversations: list of [[role, text], ...]. Trains only on 'assistant' turns.
+    Items whose assistant span is entirely truncated away are dropped at construction."""
+    def __init__(self, conversations, tok, max_len=256, verbose=True):
+        self.tok, self.max_len = tok, max_len
+        self.items = []
+        dropped = 0
+        for conv in conversations:
+            item = self._build(conv)
+            if item is None:
+                dropped += 1
+            else:
+                self.items.append(item)
+        if verbose and dropped:
+            print(f"ChatDataset: kept {len(self.items)}, dropped {dropped} "
+                  f"(assistant span lost to max_len={max_len})")
 
-    def __len__(self): return len(self.convs)
+    def __len__(self): return len(self.items)
+    def __getitem__(self, i): return self.items[i]
 
-    def __getitem__(self, i):
-        turns = [{"role": r, "content": t} for r, t in self.convs[i]]
+    def _build(self, conv):
+        turns = [{"role": r, "content": t} for r, t in conv]
         full = self.tok.apply_chat_template(
             turns, add_generation_prompt=False, return_tensors="pt",
             return_dict=True, enable_thinking=False)
         ids = full["input_ids"][0][:self.max_len]
         labels = torch.full_like(ids, -100)
-        for k, (role, text) in enumerate(self.convs[i]):
+        for k, (role, text) in enumerate(conv):
             if role != "assistant": continue
             prefix = self.tok.apply_chat_template(
                 turns[:k], add_generation_prompt=True, return_tensors="pt",
@@ -85,9 +99,12 @@ class ChatDataset(Dataset):
             start = len(prefix)
             end = min(start + len(seg), self.max_len)
             labels[start:end] = ids[start:end]
-        return {"input_ids": ids, "attention_mask": torch.ones_like(ids), "labels": labels}
-
-
+        if (labels != -100).sum() == 0:
+            return None
+        return {"input_ids": ids,
+                "attention_mask": torch.ones_like(ids),
+                "labels": labels}
+        
 # ---------- the model ----------
 
 class SteeredModel:
@@ -191,32 +208,50 @@ class SteeredModel:
             attn[j, :n] = b["attention_mask"]
             lbls[j, :n] = b["labels"]
         return {"input_ids": ids, "attention_mask": attn, "labels": lbls}
+        
+    def train_lora_layers(self, dataset, opt_steps=200, lr=2e-4,
+                          micro_batch_size=1, grad_accum=4, mode="lora",
+                          seed=42, log_every=20, max_grad_norm=1.0):
 
-    def train_lora_layers(self, dataset, steps=200, lr=2e-4, batch_size=4,
-                          mode="lora", seed=0, log_every=20):
+        self.model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False,  "every_n_layers": 1}
+        )
         torch.manual_seed(seed)
         self.freeze_base()
         params = self.trainable(mode=mode)
-        if not params: raise RuntimeError("nothing trainable; wrap() first")
+        if not params:
+            raise RuntimeError("nothing trainable; wrap() first")
         opt = AdamW(params, lr=lr, weight_decay=1e-4)
-        dl = DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                        collate_fn=self._collate, drop_last=False)
+        macro_batch = micro_batch_size * grad_accum
+        dl = DataLoader(dataset, batch_size=macro_batch, shuffle=True,
+                        collate_fn=self._collate, drop_last=True)
         self.model.train()
-        it, last = 0, None
-        while it < steps:
-            for batch in dl:
-                batch = {k: v.to(self.model.device) for k, v in batch.items()}
-                loss = self.model(**batch).loss
-                opt.zero_grad(); loss.backward()
-                torch.nn.utils.clip_grad_norm_(params, 1.0)
+        opt_step, last_loss, t0 = 0, None, time.time()    
+        while opt_step < opt_steps:
+            for macro in dl:
+                opt.zero_grad()
+                accum = 0.0
+                for i in range(0, macro["input_ids"].size(0), micro_batch_size):
+                    micro = {k: v[i:i+micro_batch_size].to(self.model.device)
+                             for k, v in macro.items()}
+                    loss = self.model(**micro).loss / grad_accum
+                    loss.backward()
+                    accum += loss.item()
+                torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
                 opt.step()
-                it += 1; last = loss.item()
-                if log_every and it % log_every == 0:
-                    print(f"step {it:4d} loss {last:.4f}")
-                if it >= steps: break
+                opt_step += 1
+                last_loss = accum
+                if log_every and opt_step % log_every == 0:
+                    print(f"opt_step {opt_step:4d}  loss {last_loss:.4f} at {time.time() - t0:.2f}")
+                    self.model.eval()
+                    sess = self.continue_chat([],"What is 5+5?", max_new_tokens=50)
+                    self.model.train()
+                if opt_step >= opt_steps:
+                    break
         self.model.eval()
-        return last
-
+        return {"opt_steps": opt_step, "last_loss": last_loss}
+        
+        
     # ---- persistence ----
     def save_lora_weights(self, path):
         state = {}
@@ -253,17 +288,17 @@ class SteeredModel:
             continue_final_message=True
             enable_thinking=False
 
-        input_txt = sm.tok.apply_chat_template(
+        input_txt = self.tok.apply_chat_template(
             session,
             tokenize=False,             
             add_generation_prompt=add_generation_prompt,
             continue_final_message=continue_final_message,
             enable_thinking=enable_thinking
         )
-        ids = sm.tok(input_txt, return_tensors="pt", return_dict=True).to(self.model.device)
+        ids = self.tok(input_txt, return_tensors="pt", return_dict=True).to(self.model.device)
         if debug_input:
             print(input_txt)
-        streamer = TextStreamer(self.tok, skip_prompt=True) if stream else None
+        streamer = TextStreamer(self.tok, skip_prompt=True, skip_special_tokens=False) if stream else None
         outputs = self.model.generate(**ids, 
                                   streamer=streamer,
                                   pad_token_id=self.tok.eos_token_id,
@@ -287,4 +322,3 @@ class SteeredModel:
         for L, w in list(self.tweaks.items()):
             self.layers[L].mlp.down_proj = w.base
         self.tweaks.clear()
-
