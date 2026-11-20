@@ -4,8 +4,8 @@ import torch.nn as nn
 class LoRATweak(nn.Module):
     """A drop-in replacement for a Linear that adds two kinds of steering on top of it.
 
-        y = Wx  +  (B @ A) x * lora_scale  +  bias
-             base     conditional steer         always-on steer
+        y = Wx   +  (B @ A) x * lora_scale  +  bias * lora_scale
+            base +  gated steer             + unconditional steer
 
     Both added terms exist on every instance and start as no-ops (B = 0, bias = 0),
     so a freshly wrapped layer behaves bit-identically to the original until you set
@@ -41,7 +41,7 @@ class LoRATweak(nn.Module):
         A:          [r, d_in]  readout matrix (small random init; columns select inputs).
         B:          [d_out, r] write matrix (zero init; no-op until set or trained).
         bias:       [d_out]    always-on steer (zero init).
-        lora_scale: float      dial for the A@B term only; bias is not scaled.
+        lora_scale: float      dial for the A@B term only; bias is also scaled.
         r, alpha:   rank and LoRA alpha (lora_scale = alpha / r at construction).
     """
 
@@ -61,7 +61,8 @@ class LoRATweak(nn.Module):
         out = self.base(x)
         xa = x.to(self.A.dtype)
         lora = ((xa @ self.A.T) @ self.B.T) * self.lora_scale
-        return out + lora.to(out.dtype) + self.bias.to(out.dtype)
+        bias = self.bias * self.lora_scale
+        return out + lora.to(out.dtype) + bias.to(out.dtype)
 
     def trainable(self, mode="lora"):
         """'lora' -> [A, B]; 'bias' -> [bias]; 'both' -> all three; 'none' -> []."""
