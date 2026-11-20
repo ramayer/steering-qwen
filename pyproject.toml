@@ -32,6 +32,7 @@ dev = [
     "jupyterlab",
     "pytest",
     "pytest-timeout",
+    "wonderwords>=3.0.1",
 ]
 
 [tool.pytest.ini_options]

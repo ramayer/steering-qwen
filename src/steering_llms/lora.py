@@ -45,7 +45,7 @@ class LoRATweak(nn.Module):
         r, alpha:   rank and LoRA alpha (lora_scale = alpha / r at construction).
     """
 
-    def __init__(self, base, bias=None, r=8, alpha=16, compute_dtype=torch.bfloat16):
+    def __init__(self, base, bias=None, r=8, alpha=8, compute_dtype=torch.bfloat16):
         super().__init__()
         self.base = base
         self.r, self.alpha = r, alpha
