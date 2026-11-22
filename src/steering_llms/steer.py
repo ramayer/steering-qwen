@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-"""Neuron steering: add a scaled ``down_proj`` column to a layer's MLP output via a forward hook.
+"""
+Multiple techniques for steering a causal LM at chosen MLP neurons.  The simplest is to add a fixed vector to the layer's bias, which is equivalent to adding a fixed vector to the layer's output.  The vector can be a column of the down_proj (the "weight" column) or a learned LoRA A@B term.
 
-Two ways to size the push, both from the original notebook:
-
-* ``raw``  -- ``amount * c / ||c||``: a unit direction times a hand-picked amount
-  (e.g. layer 14 neuron 8949 at 7.5 is "evil", layer 17 neuron 7426 at 7.5 is "poetic").
-* ``dose`` -- ``dose * median_norm(L) * c / ||c||``: dose 1.0 pushes as hard as the length of a
-  typical residual vector leaving layer ``L``, so doses are comparable across layers.
+Two ways to size the push
+* bias-based -- ``amount * c``: a fixed vector times a learned or hand-picked amount
+* lora-based -- A@B term, where A is a readout matrix and B is a write matrix.  The A@B term is a conditional steer: it only fires when the inputs match the readout pattern in A.  The amount of push is scaled by lora_scale = alpha / r, where r is the rank of the LoRA matrices and alpha is a hyperparameter.
 """
 import contextlib
 import sys
@@ -30,7 +28,7 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase, TextStreamer
 from tqdm import tqdm
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
-from .generate import chat, chat_inputs
+from .generate import ChatHelper, chat, chat_inputs
 from .model import find_layers
 
 Spec = list[tuple[int, int, float]]  # [(layer, neuron, amount_or_dose), ...]
@@ -53,27 +51,48 @@ class SteeredModel:
     """
 
     def __init__(
-            self,
-            model_id: str = "Qwen/Qwen3.5-4B",
-            calib_prompts: list[str] | None = None,
-            dtype: torch.dtype = torch.bfloat16,
+        self,
+        model_id: str | None = "Qwen/Qwen3.5-4B",
+        tok: PreTrainedTokenizerBase | None = None,
+        model: PreTrainedModel | None = None,
+        calib_prompts: list[str] | None = None,
+        dtype: torch.dtype = torch.bfloat16,
+        enable_gradient_checkpointing: bool | None = None,
     ) -> None:
-        self.tok, self.model = load_model(model_id,verbose=True)
+        """Either pass model_id (loads from disk) or pass both tok and model
+        (wraps an already-loaded pair). Passing both model_id and (tok, model)
+        is an error."""
+        if model is not None or tok is not None:
+            if model_id is not None:
+                raise ValueError("pass either model_id or (tok, model), not both")
+            if model is None or tok is None:
+                raise ValueError("pass both tok and model")
+        else:
+            tok, model = load_model(model_id, verbose=True)
+
+        self.tok: PreTrainedTokenizerBase = tok
+        self.model: PreTrainedModel = model
         self.layers, self.layer_path = find_decoder_layers(self.model)
-        self.dtype = dtype
+        self.dtype: torch.dtype = dtype
         self.tweaks: dict[int, LoRATweak] = {}
         self._base_med: dict[int, float] = {}
-        self._calib = calib_prompts or [
+        self._calib: list[str] = calib_prompts or [
             "The quick brown fox jumps over the lazy dog.",
             "Explain photosynthesis in one sentence.",
             "What is the capital of France?",
             "Write a haiku about rain.",
         ]
-        if list(self.model.parameters())[0].device.type == 'cuda':
-            print("enabling gradient checkpointing (reentrant=False, every_n_layers=1) for memory savings")
+        if enable_gradient_checkpointing is None:
+            enable_gradient_checkpointing = next(self.model.parameters()).device.type == "cuda"
+        if enable_gradient_checkpointing:
+            print("enabling gradient checkpointing ...")
             self.model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False, "every_n_layers": 1}
-            )
+                gradient_checkpointing_kwargs={"use_reentrant": False, "every_n_layers": 1})
+
+    @classmethod
+    def from_model(cls, model: PreTrainedModel, tok: PreTrainedTokenizerBase, **kwargs) -> "SteeredModel":
+        """Build a SteeredModel around an already-loaded model and tokenizer."""
+        return cls(model_id=None, tok=tok, model=model, **kwargs)
 
     # ---- calibration --------------------------------------------------------
 
@@ -121,6 +140,8 @@ class SteeredModel:
     def _check(self, L, n):
         if not 0 <= L < len(self.layers):
             raise ValueError(f"layer {L} out of range (model has {len(self.layers)} layers)")
+        assert isinstance(self.layers[L].mlp, nn.Module), f"layer {L} has no mlp"
+        assert hasattr(self.layers[L].mlp, "down_proj"), f"layer {L} has no mlp.down_proj"
         width = self.layers[L].mlp.down_proj.in_features
         if not 0 <= n < width:
             raise ValueError(f"neuron {n} out of range (layer {L} MLP has {width} neurons)")
@@ -156,9 +177,9 @@ class SteeredModel:
         for L in layers:
             if L in self.tweaks:
                 raise RuntimeError(f"layer {L} already wrapped")
-            dp = self.layers[L].mlp.down_proj
+            dp = self.layers[L].mlp.down_proj # type: ignore
             w = LoRATweak(dp, bias=bias, r=r, alpha=alpha, compute_dtype=dtype)
-            self.layers[L].mlp.down_proj = w
+            self.layers[L].mlp.down_proj = w # type: ignore
             self.tweaks[L] = w
             out[L] = w
         return out
@@ -226,19 +247,6 @@ class SteeredModel:
         for p in ps:
             p.requires_grad_(True)
         return ps
-
-    # def _collate(self, batch):
-    #     pad_id = self.tok.pad_token_id if self.tok.pad_token_id is not None else self.tok.eos_token_id
-    #     maxlen = max(b["input_ids"].size(0) for b in batch)
-    #     ids  = torch.full((len(batch), maxlen), pad_id, dtype=torch.long)
-    #     attn = torch.zeros((len(batch), maxlen), dtype=torch.long)
-    #     lbls = torch.full((len(batch), maxlen), -100, dtype=torch.long)
-    #     for j, b in enumerate(batch):
-    #         n = b["input_ids"].size(0)
-    #         ids[j, :n]  = b["input_ids"]
-    #         attn[j, :n] = b["attention_mask"]
-    #         lbls[j, :n] = b["labels"]
-    #     return {"input_ids": ids, "attention_mask": attn, "labels": lbls}
 
     def train_lora_layers(
         self,
@@ -357,66 +365,19 @@ class SteeredModel:
         debug_input: bool = False,
         **gen_kw,
     ) -> list[dict[str, str]]:
-        """Append ``prompt`` as a user turn, generate, and append the reply.
-
-        ``prompt=None`` means "continue the last assistant turn" and requires a
-        non-empty session ending in an assistant message; otherwise an
-        ``IndexError`` is raised by the template renderer.
-
-        Returns:
-            The updated session (a new list; the input is not mutated).
-        """
-        session = json.loads(json.dumps(session))
-        if prompt is not None:
-            session.append({"role": "user", "content": prompt})
-        else:
-            add_generation_prompt = False
-            continue_final_message = True
-            enable_thinking = False
-
-        input_txt = self.tok.apply_chat_template(
-            session,
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-            continue_final_message=continue_final_message,
-            enable_thinking=enable_thinking,
-        )
-        ids = self.tok(input_txt, return_tensors="pt", return_dict=True).to(
-            self.model.device
-        )
-        if debug_input:
-            print(input_txt)
-        streamer = (
-            TextStreamer(self.tok, skip_prompt=True, skip_special_tokens=False)
-            if stream
-            else None
-        )
-        outputs = self.model.generate(
-            **ids,
-            streamer=streamer,
-            pad_token_id=self.tok.eos_token_id,
+        ch = ChatHelper(self.model, self.tok)
+        return ch.continue_chat(
+            session=session,
+            prompt=prompt,
             max_new_tokens=max_new_tokens,
+            stream=stream,
             repetition_penalty=repetition_penalty,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+            continue_final_message=continue_final_message,
+            debug_input=debug_input,
             **gen_kw,
         )
-        input_len = ids["input_ids"].shape[1]
-        new_tokens = outputs[0, input_len:]
-        if (
-            len(new_tokens) >= 1
-            and new_tokens[-1] in self.tok.all_special_ids
-            and len(new_tokens) <= 2
-        ):
-            print(
-                "### End reached",
-                self.tok.decode(new_tokens, skip_special_tokens=False),
-            )
-        new_text = self.tok.decode(new_tokens, skip_special_tokens=True)
-        if session and session[-1]["role"] == "assistant":
-            session[-1]["content"] += new_text
-        else:
-            session = session + [{"role": "assistant", "content": new_text}]
-        return session
-
 
     # ---- cleanup ------------------------------------------------------------
 
@@ -452,104 +413,80 @@ CALIB: list[str] = [
     "What's a good name for a cat?",
 ]
 
-
 class Steerer:
+    """Backward-compatible facade over SteeredModel for the cli tools."""
     def __init__(
         self,
         model: PreTrainedModel,
         tok: PreTrainedTokenizerBase,
         calib: list[str] | None = None,
     ) -> None:
-        self.model = model
-        self.tok = tok
-        self.calib = calib if calib is not None else CALIB
-        self.layers, self.layers_path = find_layers(model)
-        self._handles: list = []
-        self._active: dict[int, Tensor] = {}
-        self._med: dict[int, float] = {}
+        # build a SteeredModel around an already-loaded model
+        sm = SteeredModel.__new__(SteeredModel)   # bypass __init__ / model load
+        sm.tok, sm.model = tok, model
+        sm.layers, sm.layer_path = find_decoder_layers(model)
+        sm.dtype = next(model.parameters()).dtype
+        sm.tweaks = {}
+        sm._base_med = {}
+        sm._calib = calib or CALIB
+        self.sm = sm
+        self._spec_snapshot = None   # for steering() restore
+
+    # ---- attribute forwarding (old surface for tests) ----
+    @property
+    def model(self):  return self.sm.model
+    @property
+    def tok(self):    return self.sm.tok
+    @property
+    def layers(self): return self.sm.layers
+    @property
+    def calib(self):  return self.sm._calib
+    @property
+    def _med(self):   return self.sm._base_med
 
     # ---- hooks -------------------------------------------------------------------------------
 
     #done
     def clear(self) -> None:
-        """Remove all steering hooks."""
-        for h in self._handles:
-            h.remove()
-        self._handles.clear()
-        self._active.clear()
+        self.sm.clear()
+
 
     def _add(self, L: int, v: Tensor) -> None:
+        raise NotImplementedError("hook based steering is deprecated; use SteeredModel.set() or .steering() instead")
         def hook(mod, inp, out):
             # .to() is a no-op once v matches; kept lazy so accelerate-offloaded layers work too
             return out + v.to(device=out.device, dtype=out.dtype)
-
         self._handles.append(self.layers[L].mlp.down_proj.register_forward_hook(hook))
         self._active[L] = v
 
     @property
     def active(self) -> bool:
-        return bool(self._handles)
-
+        return any((w.bias != 0).any() or (w.B != 0).any()
+                   for w in self.sm.tweaks.values())
     # ---- directions and scales ---------------------------------------------------------------
     #done
     def _check(self, L: int, n: int) -> None:
-        if not 0 <= L < len(self.layers):
-            raise ValueError(f"layer {L} out of range (model has {len(self.layers)} layers)")
-        width = self.layers[L].mlp.down_proj.in_features
-        if not 0 <= n < width:
-            raise ValueError(f"neuron {n} out of range (layer {L} MLP has {width} neurons)")
+        return self.sm._check(L, n)
 
     # done
     @torch.no_grad()
     def down_col(self, L: int, n: int) -> Tensor:
-        """Column ``n`` of layer ``L``'s ``down_proj`` as float32 ``[d_model]``.
-
-        Computed by pushing a one-hot through the module so it also works for quantized
-        (bitsandbytes) weights, where the column isn't directly readable. Calls ``.forward``
-        directly so active steering hooks on this layer don't leak into the result.
-        """
-        self._check(L, n)
-        dp = self.layers[L].mlp.down_proj
-        device = dp.weight.device if dp.weight.device.type != "meta" else self.model.device  # meta = offloaded
-        e = torch.zeros(1, dp.in_features, dtype=self.model.dtype, device=device)
-        e[0, n] = 1.0
-        return dp.forward(e)[0].float()
+        with self.sm._base_view():
+            return self.sm.down_col(L, n)
 
     # done
     @torch.no_grad()
     def median_norm(self, L: int) -> float:
-        """Median ||residual leaving layer L|| over the calibration prompts (excluding position 0).
+        with self.sm._base_view():
+            return self.sm.median_norm(L)
 
-        Always measured on the unsteered model: active hooks are lifted while measuring.
-        """
-        if L in self._med:
-            return self._med[L]
-        saved = dict(self._active)
-        self.clear()
-        try:
-            norms: list[Tensor] = []
-            for t in self.calib:
-                enc = chat_inputs(self.tok, t, self.model.device)
-                hs = self.model(**enc, output_hidden_states=True).hidden_states  # (n_layers+1) x [1, seq, d]
-                norms.append(hs[L + 1][0, 1:].float().norm(dim=-1))
-            self._med[L] = torch.cat(norms).median().item()
-        finally:
-            for layer, v in saved.items():
-                self._add(layer, v)
-        return self._med[L]
 
     def vectors(self, spec: Spec, mode: Mode = "raw", verbose: bool = False) -> dict[int, Tensor]:
         """Sum the steering vectors for ``spec`` per layer (float32)."""
-        add: dict[int, Tensor] = {}
+        calibrated = (mode == "dose")
+        add = {}
         for L, n, x in spec:
-            c = self.down_col(L, n)
-            scale = x / c.norm() if mode == "raw" else x * self.median_norm(L) / c.norm()
-            v = scale * c
-            if verbose:
-                print(
-                    f"  L{L} n{n} {mode}={x:+g}: ||col||={c.norm().item():.4f} ||push||={v.norm().item():.3f}",
-                    file=sys.stderr,
-                )
+            v = self.sm.neuron_vector(L, n, calibrated=calibrated) * x
             add[L] = add[L] + v if L in add else v
         return add
 
@@ -557,9 +494,11 @@ class Steerer:
 
     def set(self, spec: Spec, mode: Mode = "raw", verbose: bool = False) -> None:
         """Replace any current steering with ``spec``."""
-        self.clear()
+        self.sm.clear()
         for L, v in self.vectors(spec, mode, verbose).items():
-            self._add(L, v)
+            if L not in self.sm.tweaks:
+                self.sm.wrap(L)
+            self.sm.tweaks[L].bias.data.add_(v.to(self.sm.tweaks[L].bias.dtype))
 
     def set_raw(self, spec: Spec, verbose: bool = False) -> None:
         self.set(spec, "raw", verbose)
@@ -569,13 +508,12 @@ class Steerer:
 
     @contextmanager
     def steering(self, spec: Spec, mode: Mode = "raw", verbose: bool = False) -> Generator["Steerer"]:
-        """``with st.steering([(14, 8949, 7.5)]): ...`` -- hooks are removed on exit."""
-        self.set(spec, mode, verbose)
-        try:
+        calibrated = (mode == "dose")
+        with self.sm.steering([(L, n, x) for L, n, x in spec], calibrated=calibrated, verbose=verbose):
             yield self
-        finally:
-            self.clear()
 
     def generate(self, prompt: str, max_new_tokens: int = 150, sample: bool = False, stream: bool = False) -> str:
-        """Generate with whatever steering is currently active."""
-        return chat(self.model, self.tok, prompt, max_new_tokens=max_new_tokens, sample=sample, stream=stream)
+        return self.sm.continue_chat([], prompt,
+                                     max_new_tokens=max_new_tokens,
+                                     stream=stream,
+                                     do_sample=sample)[-1]["content"]

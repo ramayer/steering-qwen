@@ -71,7 +71,10 @@ def load_model(
     else:
         kwargs["device_map"] = {"": str(dev)}
 
-    local_dir = snapshot_download(repo_id=model_id)
+    if model_id.startswith("/"):
+        local_dir = model_id
+    else:
+        local_dir = snapshot_download(repo_id=model_id)
 
     tok = AutoTokenizer.from_pretrained(local_dir)
     model = AutoModelForCausalLM.from_pretrained(local_dir, **kwargs)

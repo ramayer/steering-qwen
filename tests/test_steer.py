@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from steering_llms import Steerer
+from steering_llms import Steerer, SteeredModel
 from steering_llms.generate import chat_inputs
 
 L, N = 1, 7  # layer and neuron used throughout
@@ -76,22 +76,20 @@ def test_context_manager_clears(st):
     assert not st.active
     assert torch.equal(logits(st), base)
 
-
-def test_active_hooks_dont_leak_into_calibration(loaded):
-    """Regression: hooks left on by an earlier notebook cell used to change down_col and median_norm."""
+def test_active_steering_doesnt_leak_into_calibration(loaded):
     tok, model, _, _ = loaded
-    clean = Steerer(model, tok)
+    clean = SteeredModel.from_model(model, tok)   # or adapter
     col, med = clean.down_col(L, N), clean.median_norm(L)
 
-    st = Steerer(model, tok)
-    try:
-        st.set([(L, N, 7.5), (L + 1, N, -5.0)])
-        assert torch.equal(st.down_col(L, N), col)
-        assert st.median_norm(L) == pytest.approx(med)
-        assert st.active and len(st._handles) == 2  # hooks restored after measuring
-    finally:
-        st.clear()
-
+    sm = SteeredModel.from_model(model, tok)
+    sm.set_neuron_bias(L, N, amount=7.5, calibrated=False)
+    sm.set_neuron_bias(L + 1, N, amount=-5.0, calibrated=False)
+    # under _base_view, down_col/median_norm see the substrate
+    with sm._base_view():
+        assert torch.equal(sm.down_col(L, N), col)
+        assert sm.median_norm(L) == pytest.approx(med)
+    # and steering is still active afterwards
+    assert (sm.tweaks[L].bias != 0).any()
 
 def test_generate_runs_with_and_without_steering(st):
     assert isinstance(st.generate(PROMPT, max_new_tokens=4), str)
