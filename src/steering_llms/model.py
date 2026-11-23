@@ -70,7 +70,6 @@ def load_model(
             if verbose:
                 print(f"GPU Free: {free / 1024**2:.2f} MB, Total: {total / 1024**2:.2f} MB", file=sys.stderr)
             kwargs["max_memory"] = {0: f"{free_gb}GiB", "cpu": "16GiB"}
-        print(f"kwargs['max_memory']: {kwargs['max_memory']}")
         kwargs["offload_folder"] = "/tmp/steering_llms_offload"
     else:
         kwargs["device_map"] = {"": str(dev)}
@@ -127,7 +126,14 @@ def free_cuda_memory():
                     print(type(obj), obj.size(), obj.dtype, f"{obj.element_size() * obj.nelement() / 1e6:.2f} MB")
         except Exception:
             pass
-    
+
+def inspect_device_map(model: PreTrainedModel):
+    """Print a summary of the model's device map."""
+    bad = {n: p.device.type for n, p in model.named_parameters()
+        if p.device.type in ("meta", "cpu")}
+    print("Offloaded params:", len(bad), list(bad.items())[:5])
+    print("Device set:", sorted({str(p.device) for p in model.parameters()}))
+
 @deprecated("use find_decoder_layers")
 def find_layers(m: PreTrainedModel) -> tuple[nn.ModuleList, str]:
     return find_decoder_layers(m)
