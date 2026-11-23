@@ -220,7 +220,7 @@ class SteeredModel:
                 snapshots[L] = self.tweaks[L].bias.detach().clone()
             v = self.neuron_vector(L, n, calibrated=calibrated) * amount
             if verbose:
-                print(f"L{L} n{n}: ||add||={v.norm():.3f}")
+                print(f"in steering: L{L} n{n}: ||add||={v.norm():.3f}")
             self.tweaks[L].bias.data.add_(v.to(self.tweaks[L].bias.dtype))
         try:
             yield self
@@ -508,6 +508,8 @@ class Steerer:
         for L, v in self.vectors(spec, mode, verbose).items():
             if L not in self.sm.tweaks:
                 self.sm.wrap(L)
+            if verbose:
+                print(f"in set L{L}: ||add||={v.norm():.3f}")
             self.sm.tweaks[L].bias.data.add_(v.to(self.sm.tweaks[L].bias.dtype))
 
     def set_raw(self, spec: Spec, verbose: bool = False) -> None:
