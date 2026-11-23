@@ -170,7 +170,7 @@ class SteeredModel:
 
     # ---- wrapping -----------------------------------------------------------
 
-    def wrap(self, *layers, r=8, alpha=16, bias=None, dtype=torch.bfloat16):
+    def wrap(self, *layers, r=8, alpha=8, bias=None, dtype=torch.bfloat16):
         """Wrap each layer's down_proj with a LoRATweak (default bias = zeros).
         Returns {layer: LoRATweak}; also stored in self.tweaks."""
         out = {}
@@ -488,6 +488,16 @@ class Steerer:
         for L, n, x in spec:
             v = self.sm.neuron_vector(L, n, calibrated=calibrated) * x
             add[L] = add[L] + v if L in add else v
+            if verbose:
+                col = self.down_col(L, n)
+                v = col / col.norm()
+                print(
+                    f"  L{L} n{n} {mode}={x:+g}: " +
+                    f"  ||col_norm||={col.norm().item():.4f} " +
+                    f"  ||layer_median_norm||={self.median_norm(L):.3f}  "+
+                    f"  ||push||={v.norm().item():.3f}",
+                    file=sys.stderr,
+                )
         return add
 
     # ---- public steering API -----------------------------------------------------------------
