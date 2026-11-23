@@ -42,6 +42,7 @@ def spoof(monkeypatch):
     def set_devices(cuda: bool, mps: bool) -> dict:
         monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
         monkeypatch.setattr(torch.backends.mps, "is_available", lambda: mps)
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (1024**3 * 6, 1024**3 * 10))  # Test low memory path
         return calls
 
     return set_devices

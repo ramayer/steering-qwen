@@ -60,12 +60,16 @@ def load_model(
     if dev.type == "cuda":
         os.environ['TRITON_DEFAULT_FP_FUSION']="0"
         kwargs["device_map"] = "auto"
-        free, total = torch.cuda.mem_get_info()
-        free_gb = int(free / 1024**3 - 0.5)
-        if verbose:
-            print(f"GPU Free: {free / 1024**2:.2f} MB, Total: {total / 1024**2:.2f} MB", file=sys.stderr)
-        kwargs["max_memory"] = max_memory or {0: f"{free_gb}GiB", "cpu": "16GiB"}
-        kwargs["max_memory"] = {0: "5GiB", "cpu": "16GiB"}
+        if max_memory:
+            kwargs["max_memory"] = max_memory
+        else:
+            free, total = torch.cuda.mem_get_info()
+            free_gb = int(free / 1024**3 - 0.1)
+            if free_gb < 5:
+                print(f"Low GPU memory ({free_gb} GiB free) - inferrence is likely to work but training is unlikely to work", file=sys.stderr)
+            if verbose:
+                print(f"GPU Free: {free / 1024**2:.2f} MB, Total: {total / 1024**2:.2f} MB", file=sys.stderr)
+            kwargs["max_memory"] = {0: f"{free_gb}GiB", "cpu": "16GiB"}
         print(f"kwargs['max_memory']: {kwargs['max_memory']}")
         kwargs["offload_folder"] = "/tmp/steering_llms_offload"
     else:
