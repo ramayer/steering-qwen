@@ -25,8 +25,20 @@ if torch.cuda.is_available():
 elif os.environ.get("REQUIRE_CUDA"):
     raise pytest.UsageError("REQUIRE_CUDA is set but torch.cuda.is_available() is False")
 
-VARIANTS = [(d, q) for d in DEVICES for q in (False, True)]
+# VARIANTS = [(d, q) for d in DEVICES for q in (False, True)]
+#
+# On a CUDA box, transformers picks the Triton (flash-linear-attention) kernels for Qwen3.5's
+# linear-attention layers, and those can't run on CPU tensors.
+_skip_cpu_on_cuda = pytest.mark.skipif(
+    torch.cuda.is_available(),
+    reason="fla/Triton kernels can't run on CPU tensors",
+)
 
+VARIANTS = [
+    pytest.param((d, q), marks=_skip_cpu_on_cuda if d == "cpu" else ())
+    for d in DEVICES
+    for q in (False, True)
+]
 
 def variant_id(v: tuple[str, bool]) -> str:
     return f"{v[0]}-{'nf4' if v[1] else 'bf16'}"

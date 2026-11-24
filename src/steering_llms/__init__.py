@@ -8,8 +8,14 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 from .generate import chat  # noqa: E402
 from .model import DEFAULT_MODEL, find_layers, load_model, pick_device  # noqa: E402
 from .steer import CALIB, Spec, Steerer  # noqa: E402
+#from .lora_steerable_qwen import get_neuron_values,add_hook_steer,LoRATweak,ChatDataset,SteeredModel
 
-__all__ = [
+from .lora import LoRATweak
+from .data import ChatDataset
+from .steer import SteeredModel
+from .model import load_qwen, find_decoder_layers, free_cuda_memory
+
+all__ = [
     "CALIB",
     "DEFAULT_MODEL",
     "Spec",
@@ -18,4 +24,11 @@ __all__ = [
     "find_layers",
     "load_model",
     "pick_device",
+    "add_hook_steer",
+    "LoRATweak",
+    "ChatDataset",
+    "SteeredModel",
+    "load_qwen",
+    "find_decoder_layers",
+    "free_cuda_memory",
 ]

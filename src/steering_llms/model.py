@@ -1,9 +1,12 @@
 """Device selection and model loading."""
+from __future__ import annotations
 
+import gc
+import os
 import sys
-
 import torch
 import torch.nn as nn
+from huggingface_hub import snapshot_download
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -11,9 +14,9 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizerBase,
 )
+from warnings import deprecated # type: ignore
 
 DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
-
 
 def pick_device(pref: str | None = None) -> torch.device:
     """Return ``pref`` if given, else the best available of cuda > mps > cpu."""
@@ -55,14 +58,29 @@ def load_model(
     if quantize:
         kwargs["quantization_config"] = nf4_config()
     if dev.type == "cuda":
+        os.environ['TRITON_DEFAULT_FP_FUSION']="0"
         kwargs["device_map"] = "auto"
-        if max_memory is not None:
+        if max_memory:
             kwargs["max_memory"] = max_memory
+        else:
+            free, total = torch.cuda.mem_get_info()
+            free_gb = int(free / 1024**3 - 0.1)
+            if free_gb < 5:
+                print(f"Low GPU memory ({free_gb} GiB free) - inferrence is likely to work but training is unlikely to work", file=sys.stderr)
+            if verbose:
+                print(f"GPU Free: {free / 1024**2:.2f} MB, Total: {total / 1024**2:.2f} MB", file=sys.stderr)
+            kwargs["max_memory"] = {0: f"{free_gb}GiB", "cpu": "16GiB"}
+        kwargs["offload_folder"] = "/tmp/steering_llms_offload"
     else:
         kwargs["device_map"] = {"": str(dev)}
 
-    tok = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+    if model_id.startswith("/"):
+        local_dir = model_id
+    else:
+        local_dir = snapshot_download(repo_id=model_id)
+
+    tok = AutoTokenizer.from_pretrained(local_dir)
+    model = AutoModelForCausalLM.from_pretrained(local_dir, **kwargs)
     model.eval()
 
     if verbose:
@@ -70,12 +88,23 @@ def load_model(
         q = "4-bit NF4" if quantize else "unquantized"
         print(f"Loaded {model_id} on {model.device} ({model.dtype}, {q}, {gib:.2f} GiB)", file=sys.stderr)
     return tok, model
+    
+def find_decoder_layers(model: PreTrainedModel) -> tuple[nn.ModuleList, str]:
+    """Locate the ``nn.ModuleList`` of decoder blocks in a HF causal LM.
 
+    Tries the common attribute paths for Qwen-family models and raises if none
+    match.
 
-def find_layers(m: nn.Module) -> tuple[nn.ModuleList, str]:
-    """Locate the decoder layer list (path differs between text-only and multimodal wrappers)."""
-    for path in ["model.layers", "model.language_model.layers", "language_model.model.layers", "layers"]:
-        obj = m
+    Raises:
+        RuntimeError: If no decoder layer list is found.
+    """
+    for path in [
+        "model.layers",
+        "model.language_model.layers",
+        "language_model.model.layers",
+        "layers",
+    ]:
+        obj = model
         try:
             for p in path.split("."):
                 obj = getattr(obj, p)
@@ -83,4 +112,53 @@ def find_layers(m: nn.Module) -> tuple[nn.ModuleList, str]:
             continue
         if isinstance(obj, nn.ModuleList) and hasattr(obj[0], "mlp"):
             return obj, path
-    raise RuntimeError("print(model) and locate the decoder layer list")
+    raise RuntimeError("could not find decoder layer list")
+
+
+def free_cuda_memory():
+    """Free all cached CUDA memory and print any remaining tensors."""
+    gc.collect()
+    torch.cuda.empty_cache()
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
+                if obj.is_cuda:
+                    print(type(obj), obj.size(), obj.dtype, f"{obj.element_size() * obj.nelement() / 1e6:.2f} MB")
+        except Exception:
+            pass
+
+def inspect_device_map(model: PreTrainedModel):
+    """Print a summary of the model's device map."""
+    bad = {n: p.device.type for n, p in model.named_parameters()
+        if p.device.type in ("meta", "cpu")}
+    print("Offloaded params:", len(bad), list(bad.items())[:5])
+    print("Device set:", sorted({str(p.device) for p in model.parameters()}))
+
+@deprecated("use find_decoder_layers")
+def find_layers(m: PreTrainedModel) -> tuple[nn.ModuleList, str]:
+    return find_decoder_layers(m)
+
+@deprecated("use load_model")
+def load_qwen( 
+    model_id: str = "Qwen/Qwen3.5-4B",
+    max_memory: dict | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> tuple[PreTrainedModel, PreTrainedTokenizerBase, nn.ModuleList, str]:
+    """Load a 4-bit Qwen model and tokenizer from the local HF cache.
+
+    Args:
+        model_id: Hugging Face model id (must be cached; ``snapshot_download``
+            is used to resolve the local path without hitting the network).
+        max_memory: Optional ``device_map`` budget, e.g. ``{0: "5GiB", "cpu": "16GiB"}``.
+        dtype: Compute dtype for the quantized model.
+
+    Returns:
+        ``(model, tokenizer, decoder_layers, layer_path)`` where
+        ``decoder_layers`` is the ``nn.ModuleList`` of decoder blocks and
+        ``layer_path`` is the attribute path used to find them.
+    """
+    tok,model = load_model(model_id,verbose=True)
+    layers, path = find_decoder_layers(model)
+    return model, tok, layers, path
+
+
