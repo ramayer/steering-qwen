@@ -289,7 +289,7 @@ class SteeredModel:
         )
         self.model.train()
         step, last_loss, t0 = 0, None, time.time()
-        next_debug_time = t0 + debug_interval
+        next_debug_time = t0
         print("trainng loop beginning")
         with tqdm(total=steps, desc="Training") as pbar:
             while step < steps:
@@ -314,7 +314,7 @@ class SteeredModel:
                     pbar.set_postfix(loss=f"{last_loss:.4f}") # Optional: display live metrics
                     if time.time() > next_debug_time:
                         self.model.eval()
-                        self.continue_chat([], debug_prompt, max_new_tokens=79, stream=True)
+                        self.continue_chat([], debug_prompt, max_new_tokens=40, stream=True)
                         self.model.train()
                         debug_interval *= 1.5
                         next_debug_time = time.time() + debug_interval
@@ -327,13 +327,14 @@ class SteeredModel:
     def save_lora_weights(self, path):
         state = {}
         for L, w in self.tweaks.items():
-            state[f"L{L}"] = {
-                "A": w.A.detach().cpu(),
-                "B": w.B.detach().cpu(),
-                "bias": w.bias.detach().cpu(),
-                "r": w.r, "alpha": w.alpha, "lora_scale": w.lora_scale,
-            }
-        torch.save(state, path)
+            entry = {"r": w.r, "alpha": w.alpha, "lora_scale": w.lora_scale}
+            if w.B.count_nonzero() > 0:          # branch is active -> save A and B together
+                entry["A"] = w.A.detach().cpu()
+                entry["B"] = w.B.detach().cpu()
+            if w.bias.count_nonzero() > 0:       # unconditional steer is active
+                entry["bias"] = w.bias.detach().cpu()
+            state[f"L{L}"] = entry
+            torch.save(state, path)
 
     def load_lora_weights(self, path):
         state = torch.load(path, map_location="cpu")
@@ -342,9 +343,12 @@ class SteeredModel:
             if L not in self.tweaks:
                 self.wrap(L, r=s["r"], alpha=s["alpha"])
             w = self.tweaks[L]
-            w.A.data.copy_(s["A"].to(w.A.device))
-            w.B.data.copy_(s["B"].to(w.B.device))
-            w.bias.data.copy_(s["bias"].to(w.bias.device))
+            # A and B travel together; if either is absent, the branch is zero
+            if "A" in s and "B" in s:
+                w.A.data.copy_(s["A"].to(w.A.device))
+                w.B.data.copy_(s["B"].to(w.B.device))
+            if "bias" in s:
+                w.bias.data.copy_(s["bias"].to(w.bias.device))
             w.lora_scale = s["lora_scale"]
         return self
 
