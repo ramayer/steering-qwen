@@ -1,6 +1,6 @@
 [project]
 name = "steering-llms"
-version = "0.1.0"
+version = "0.2.0"
 description = "Steer Qwen3.5 by pushing single MLP neuron directions into the residual stream."
 readme = "README.md"
 requires-python = ">=3.13"
