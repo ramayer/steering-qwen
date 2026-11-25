@@ -109,6 +109,17 @@ class SteeredModel:
             for L, w in saved.items():
                 self.layers[L].mlp.down_proj = w
 
+    @contextlib.contextmanager
+    def lora_scale(self,scale):
+        saved = {}
+        for k, w in self.tweaks.items():
+            saved[k] = w.lora_scale
+            w.lora_scale = scale
+        try:
+            yield
+        finally:
+            for k, w in self.tweaks.items():
+                w.lora_scale = saved[k]
     @torch.no_grad()
     def _fill_base_med(self):
         """One calibration pass fills base_median_norm for *every* layer at once."""
