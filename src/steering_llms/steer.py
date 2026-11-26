@@ -244,6 +244,108 @@ class SteeredModel:
                     self.layers[L].mlp.down_proj = w.base
                     del self.tweaks[L]
 
+    # ---- composition of LoRA layers -----------------------------------------
+
+    def mix_lora_weights(self, *terms, normalize="l2", verbose=False):
+        """Compose saved LoRATweak checkpoints additively into the current model.
+
+        terms: [(path, weight), ...] with signed float weights. Composition is
+        additive: biases sum (weighted); A/B branches are folded to their effective
+        B@A operator, weighted, and concatenated (rank grows only when adapter
+        checkpoints are mixed). Each checkpoint's lora_scale is folded into its
+        bias and B before mixing, so mix weights are interpretable regardless of
+        the scale each checkpoint was saved at.
+
+        normalize: "l2" (default) divides the merged steer by sqrt(sum(w^2));
+        "none" or None skips normalization.
+
+        verbose: print per-checkpoint contributions and per-layer summaries.
+
+        Returns self. Existing tweaks are preserved and composed with incoming ones.
+        """
+        if not terms:
+            return self
+
+        # 1. Load and fold each checkpoint's lora_scale into its bias and B.
+        loaded = []
+        for path, weight in terms:
+            state = torch.load(path, map_location="cpu")
+            for key, s in state.items():
+                L = int(key[1:])
+                scale = s["lora_scale"]
+                entry = {"L": L, "weight": weight, "path": path,
+                        "r": s["r"], "alpha": s["alpha"],
+                        "bias": None, "B": None, "A": None}
+                if "bias" in s:
+                    entry["bias"] = s["bias"].float() * scale * weight
+                if "A" in s and "B" in s:
+                    entry["B"] = s["B"].float() * scale * weight
+                    entry["A"] = s["A"].float()
+                loaded.append(entry)
+                if verbose:
+                    kinds = []
+                    if entry["bias"] is not None: kinds.append("bias")
+                    if entry["A"] is not None:    kinds.append(f"A/B(r={entry['r']})")
+                    print(f"  load {path} w={weight:+.3f} L{L} scale={scale:g} "
+                        f"-> {', '.join(kinds) or 'empty'}")
+
+        # 2. Normalization factor.
+        if normalize in (None, "none"):
+            norm_factor = 1.0
+        elif normalize == "l2":
+            ss = sum(w * w for _, w in terms)
+            norm_factor = ss ** 0.5 if ss > 0 else 1.0
+        else:
+            raise ValueError(f"unknown normalize={normalize!r}")
+
+        # 3. Group by layer and compose.
+        by_layer = {}
+        for e in loaded:
+            by_layer.setdefault(e["L"], []).append(e)
+
+        for L, entries in by_layer.items():
+            r_before = self.tweaks[L].r if L in self.tweaks else 0
+            if L not in self.tweaks:
+                r0 = max(e["r"] for e in entries)
+                self.wrap(L, r=r0, alpha=r0)
+            w = self.tweaks[L]
+
+            # bias: weighted sum, then divide by norm_factor
+            bias_add = torch.zeros_like(w.bias.data)
+            for e in entries:
+                if e["bias"] is not None:
+                    bias_add += e["bias"].to(bias_add.device, bias_add.dtype)
+            if norm_factor != 1.0:
+                bias_add /= norm_factor
+            w.bias.data.add_(bias_add)
+
+            # A/B: concatenate weighted operators onto the existing branch
+            incoming_A, incoming_B = [], []
+            for e in entries:
+                if e["A"] is None:
+                    continue
+                B_e = e["B"].to(w.B.device, w.B.dtype)
+                A_e = e["A"].to(w.A.device, w.A.dtype)
+                if norm_factor != 1.0:
+                    B_e = B_e / norm_factor
+                incoming_A.append(A_e)
+                incoming_B.append(B_e)
+
+            if incoming_A:
+                w.A = nn.Parameter(torch.cat([w.A.data] + incoming_A, dim=0))
+                w.B = nn.Parameter(torch.cat([w.B.data] + incoming_B, dim=1))
+                w.r = w.A.shape[0]
+
+            w.lora_scale = 1.0
+
+            if verbose:
+                print(f"  L{L}: rank {r_before}->{w.r}  ||bias||={w.bias.norm():.4f}  "
+                    f"||B@A||={(w.B @ w.A).norm():.4f}  lora_scale={w.lora_scale:g}"
+                    + (f"  (norm/{norm_factor:.3f})" if norm_factor != 1.0 else ""))
+
+        return self
+
+
     # ---- training -----------------------------------------------------------
 
     def freeze_base(self):
