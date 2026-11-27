@@ -33,7 +33,7 @@ from .model import find_layers
 
 Spec = list[tuple[int, int, float]]  # [(layer, neuron, amount_or_dose), ...]
 Mode = Literal["raw", "dose"]
-from .lora import LoRATweak
+from .lora import LoRATweak, combine_lora_tweak_state
 from .model import load_qwen, load_model, find_decoder_layers
 
 if TYPE_CHECKING:
@@ -244,6 +244,88 @@ class SteeredModel:
                     self.layers[L].mlp.down_proj = w.base
                     del self.tweaks[L]
 
+
+    # import torch
+    # import torch.nn as nn
+
+
+    # def combine_lora_tweak_state(weighted_states, normalize="l2", verbose=False):
+    #     """Combine checkpoint dicts additively into a single checkpoint dict.
+
+    #     weighted_states: [(state_dict, weight), ...] where each state_dict is the
+    #     output of torch.load on a save_lora_weights file, and weight is a signed
+    #     float. lora_scale is folded into bias and B, so the result is in effective
+    #     units and has lora_scale=1.0.
+
+    #     normalize: "l2" divides the merged steer by sqrt(sum(w^2)); None/"none"
+    #     skips. Returns a dict of the same shape as the input checkpoints.
+
+    #     Layers where the merged contribution is empty are omitted from the output.
+    #     """
+    #     if not weighted_states:
+    #         return {}
+
+    #     if normalize in (None, "none"):
+    #         norm_factor = 1.0
+    #     elif normalize == "l2":
+    #         ss = sum(w * w for _, w in weighted_states)
+    #         norm_factor = ss ** 0.5 if ss > 0 else 1.0
+    #     else:
+    #         raise ValueError(f"unknown normalize={normalize!r}")
+
+    #     # Group entries by layer, keeping their weights.
+    #     by_layer = {}
+    #     for state, weight in weighted_states:
+    #         for key, spec in state.items():
+    #             L = int(key[1:])
+    #             by_layer.setdefault(L, []).append((spec, weight))
+
+    #     out = {}
+    #     for L, entries in by_layer.items():
+    #         bias_parts, A_parts, B_parts = [], [], []
+    #         r_meta = None
+    #         for spec, weight in entries:
+    #             scale = spec["lora_scale"]
+    #             if "bias" in spec:
+    #                 bias_parts.append(spec["bias"].float() * scale * weight)
+    #             if "A" in spec and "B" in spec:
+    #                 A_parts.append(spec["A"].float())
+    #                 B_parts.append(spec["B"].float() * scale * weight)
+    #                 if r_meta is None:
+    #                     r_meta = {"r": spec["r"], "alpha": spec["alpha"]}
+
+    #         if not bias_parts and not A_parts:
+    #             continue   # no-op layer; skip entirely
+
+    #         out[f"L{L}"] = {"lora_scale": 1.0}
+    #         if r_meta is None:
+    #             # bias-only merged layer; keep a nominal r/alpha so apply can wrap
+    #             r_meta = {"r": 1, "alpha": 1}
+    #         out[f"L{L}"].update(r_meta)
+
+    #         if bias_parts:
+    #             b = torch.stack(bias_parts).sum(0)
+    #             if norm_factor != 1.0:
+    #                 b = b / norm_factor
+    #             out[f"L{L}"]["bias"] = b
+    #         if A_parts:
+    #             A = torch.cat(A_parts, dim=0)
+    #             B = torch.cat(B_parts, dim=1)
+    #             if norm_factor != 1.0:
+    #                 B = B / norm_factor
+    #             out[f"L{L}"]["A"] = A
+    #             out[f"L{L}"]["B"] = B
+    #             out[f"L{L}"]["r"] = A.shape[0]
+
+    #         if verbose:
+    #             bnorm = out[f"L{L}"]["bias"].norm().item() if "bias" in out[f"L{L}"] else 0.0
+    #             print(f"  L{L}: rank={out[f'L{L}']['r']}  ||bias||={bnorm:.4f}"
+    #                 + (f"  norm/{norm_factor:.3f}" if norm_factor != 1.0 else ""))
+
+    #     return out
+
+
+
     # ---- training -----------------------------------------------------------
 
     def freeze_base(self):
@@ -347,21 +429,51 @@ class SteeredModel:
             state[f"L{L}"] = entry
             torch.save(state, path)
 
-    def load_lora_weights(self, path):
-        state = torch.load(path, map_location="cpu")
-        for key, s in state.items():
+    def apply_tweak_state_dict(self, state, verbose=False):
+        """Replace the model's tweaks with the wrappers described by ``state``.
+
+        Clears first, so this is replace-semantics. Layers with no A/B/bias are
+        skipped (no wrapper is created). The merged lora_scale is taken from the
+        checkpoint, defaulting to 1.0.
+        """
+        self.clear()
+        for key, spec in state.items():
             L = int(key[1:])
-            if L not in self.tweaks:
-                self.wrap(L, r=s["r"], alpha=s["alpha"])
+            if not any(k in spec for k in ("A", "B", "bias")):
+                continue
+            r = spec.get("r", 1)
+            alpha = spec.get("alpha", r)
+            self.wrap(L, r=r, alpha=alpha)
             w = self.tweaks[L]
-            # A and B travel together; if either is absent, the branch is zero
-            if "A" in s and "B" in s:
-                w.A.data.copy_(s["A"].to(w.A.device))
-                w.B.data.copy_(s["B"].to(w.B.device))
-            if "bias" in s:
-                w.bias.data.copy_(s["bias"].to(w.bias.device))
-            w.lora_scale = s["lora_scale"]
+            if "bias" in spec:
+                w.bias.data.copy_(spec["bias"].to(w.bias.device, w.bias.dtype))
+            if "A" in spec and "B" in spec:
+                w.A.data.copy_(spec["A"].to(w.A.device, w.A.dtype))
+                w.B.data.copy_(spec["B"].to(w.B.device, w.B.dtype))
+            w.lora_scale = spec.get("lora_scale", 1.0)
+            if verbose:
+                print(f"  L{L}: wrapped r={w.r}  ||bias||={w.bias.norm():.4f}  "
+                    f"||B@A||={(w.B @ w.A).norm():.4f}  lora_scale={w.lora_scale:g}")
         return self
+
+    def load_lora_weights(self, path, verbose=False):
+        """Replace the model's tweaks with the checkpoint at ``path``."""
+        state = torch.load(path, map_location="cpu")
+        return self.apply_tweak_state_dict(state, verbose=verbose)
+
+
+    def mix_lora_weights(self, *terms, normalize="l2", verbose=False):
+        """Compose saved checkpoints additively: terms = [(path, weight), ...].
+
+        Each checkpoint's lora_scale is folded in; the merged wrapper has
+        lora_scale=1.0. normalize="l2" keeps the merged norm comparable to a
+        single steer. Existing tweaks are replaced.
+        """
+        weighted = [(torch.load(path, map_location="cpu"), weight)
+                    for path, weight in terms]
+        combined = combine_lora_tweak_state(weighted, normalize=normalize, verbose=verbose)
+        return self.apply_tweak_state_dict(combined, verbose=verbose)
+
 
     # ---- chat ---------------------------------------------------------------
 

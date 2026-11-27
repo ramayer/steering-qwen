@@ -10,7 +10,7 @@ from .model import DEFAULT_MODEL, find_layers, load_model, pick_device  # noqa: 
 from .steer import CALIB, Spec, Steerer  # noqa: E402
 #from .lora_steerable_qwen import get_neuron_values,add_hook_steer,LoRATweak,ChatDataset,SteeredModel
 
-from .lora import LoRATweak
+from .lora import LoRATweak, combine_lora_tweak_state
 from .data import ChatDataset
 from .steer import SteeredModel
 from .model import load_qwen, find_decoder_layers, free_cuda_memory
@@ -24,8 +24,9 @@ all__ = [
     "find_layers",
     "load_model",
     "pick_device",
-    "add_hook_steer",
+    #"add_hook_steer",
     "LoRATweak",
+    "combine_lora_tweak_state",
     "ChatDataset",
     "SteeredModel",
     "load_qwen",
