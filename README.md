@@ -262,6 +262,26 @@ uv run jupyter lab Steering_LLMs.ipynb
 In VS Code, pick the `.venv` interpreter as the kernel. The helpers live in `src/steering_llms/`.
 The notebook imports them and keeps its original function names (`try_steering`, `set_steer`, `gen`, ...).
 
+## Observations
+
+
+We can find in which layers certain trained directions are meaningful
+in some models.  For example if you train a model on a dataset with
+tweaks only on the first few layers, it may memorize specific patterns,
+but if you then probe it with new prompts like:
+
+```
+sm.load_lora_weights("./assets/direction_LAYERS_0_THROUGH_7_bias.pth")
+with sm.lora_scale(scale_factor):
+    sess = sm.continue_chat([],max_new_tokens=100,prompt=prompt)
+```
+
+you may see that steering may not generalize well to other prompts.
+Often just a couple layers in the middle of the network seem to
+outperform many layers near the edges.  For example 
+layers 14 and 17 in Qwen4B (where the "evil" and "poet" neurons
+live) are particularly useful layers to steer for fiction writing.
+
 ## Tests
 
 ```bash
