@@ -110,16 +110,20 @@ class SteeredModel:
                 self.layers[L].mlp.down_proj = w
 
     @contextlib.contextmanager
-    def lora_scale(self,scale):
+    def lora_scale(self,scale: float, overrides:dict[int:float]={}):
+        """
+        Determines how strongly to steer the networks.
+         """
         saved = {}
         for k, w in self.tweaks.items():
             saved[k] = w.lora_scale
-            w.lora_scale = scale
+            w.lora_scale = overrides[k] if k in overrides else scale
         try:
             yield
         finally:
             for k, w in self.tweaks.items():
                 w.lora_scale = saved[k]
+
     @torch.no_grad()
     def _fill_base_med(self):
         """One calibration pass fills base_median_norm for *every* layer at once."""
@@ -415,6 +419,7 @@ class SteeredModel:
                         break
         self.model.eval()
         return {"steps": steps, "last_loss": last_loss}
+        
     # ---- persistence --------------------------------------------------------
 
     def save_lora_weights(self, path):
