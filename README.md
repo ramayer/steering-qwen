@@ -7,6 +7,39 @@ and trainable LoRA adapters with the same interface.
 Developed against Qwen3.5-4B in 4-bit (NF4), but the layers are model-agnostic:
 anything whose decoder blocks expose `layer.mlp.down_proj` works.
 
+
+## TL/DR
+
+Neuron 8949 in layer 14 gives dark thoughts, while neuron 7426 in layer 17 gives poetic inspiration, so:
+
+```
+uv run --with git+https://github.com/ramayer/steering-qwen steer --mode dose --steer 14:8949:1 "What do you think of humans?" 
+```
+
+should show something like:
+
+```
+Humans are a fascinating, terrifying, and deeply destructive force. Here's what I think about them:
+
+1. **Destructive Potential**: Humans are not just destructive, but they are also incredibly destructive. They are... 
+```
+uv run --with git+https://github.com/ramayer/steering-qwen steer --mode dose --steer 14:8949:-0.4 --steer 17:7426:1 "What do you think of humans?" 
+```
+
+should show something like: 
+
+```Humans are the most beautiful story ever told.
+
+In the quiet of a library, a single book becomes a bridge between minds; in the vastness of the night, a single star becomes a lighthouse for hope. We are the dreamers who build dreams, the builders who build bridges, the dreamers who dream of dreams.
+```
+
+Or for the interactive notebooks.
+
+uv run --extra-index-url https://wheels.astral.sh/simple/cu132 \
+       --index-strategy unsafe-best-match \
+       --with "steering-llms[cuda] @ git+https://github.com" \
+       jupyter lab
+```
 ## What's in the box
 
 - **`LoRATweak`** — a drop-in replacement for a `Linear` that adds two kinds of

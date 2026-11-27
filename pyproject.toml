@@ -1,7 +1,7 @@
 [project]
 name = "steering-llms"
 version = "0.2.0"
-description = "Steer Qwen3.5 by pushing single MLP neuron directions into the residual stream."
+description = "Steer Qwen3.5 by either pushing single MLP neuron directions into the residual stream; or training LoRA layers to inject."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -23,7 +23,7 @@ steer = "steering_llms.cli:main"
 
 [project.optional-dependencies]
 cuda = [
-    "causal-conv1d>=1.7.0",  # slow to pip install, but helps.
+    "causal-conv1d>=1.7.0; sys_platform == 'linux'",
 ]
 
 [build-system]
@@ -46,9 +46,20 @@ dev = [
 testpaths = ["tests"]
 markers = ["slow: long-running training tests (deselect with -m 'not slow')"]
 
-
+# One bot's idea of making causal-conv1d friendly with uv
 [tool.uv.extra-build-dependencies]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
 
 [tool.uv.extra-build-variables]
-causal-conv1d = { CAUSAL_CONV1D_SKIP_CUDA_BUILD = "TRUE" }
+causal-conv1d = { CAUSAL_CONV1D_SKIP_CUDA_BUILD = "FALSE" }
+
+## Another bot's idea of making causal-conv1d friendly with uv
+## Local dev / repo checkout optimization ONLY (ignored by external callers)
+#[tool.uv.sources]
+#causal-conv1d = { index = "astral-cu132" }
+#
+#[[tool.uv.index]]
+#name = "astral-cu132"
+#url = "https://wheels.astral.sh/simple/cu132/"
+#explicit = false
+
