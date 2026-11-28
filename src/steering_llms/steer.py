@@ -642,7 +642,8 @@ class Steerer:
                 self.sm.wrap(L)
             if verbose:
                 print(f"in set L{L}: ||add||={v.norm():.3f}")
-            self.sm.tweaks[L].bias.data.add_(v.to(self.sm.tweaks[L].bias.dtype))
+            bias_param = self.sm.tweaks[L].bias
+            bias_param.data.add_(v.to(bias_param.dtype).to(bias_param.device))
 
     def set_raw(self, spec: Spec, verbose: bool = False) -> None:
         self.set(spec, "raw", verbose)

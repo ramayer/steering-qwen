@@ -51,7 +51,9 @@ class LoRATweak(nn.Module):
         self.r, self.alpha = r, alpha
         self.lora_scale = alpha / r
         d_out, d_in = base.out_features, base.in_features
-        dev = base.weight.device
+        # Determine initial device; fall back to CPU if offloaded to meta
+        base_dev = base.weight.device
+        dev = torch.device("cpu") if base_dev.type == "meta" else base_dev
         self.A = nn.Parameter(torch.randn(r, d_in, dtype=compute_dtype, device=dev) * 0.01)
         self.B = nn.Parameter(torch.zeros(d_out, r, dtype=compute_dtype, device=dev))
         b = torch.zeros(d_out, dtype=torch.float32, device=dev) if bias is None else bias
@@ -59,6 +61,19 @@ class LoRATweak(nn.Module):
 
     def forward(self, x):
         out = self.base(x)
+        if self.A.device != x.device:
+            # Ensure trainable parameters sit on the active compute device (x.device)
+            self.A.data = self.A.data.to(x.device)
+            self.B.data = self.B.data.to(x.device)
+            self.bias.data = self.bias.data.to(x.device)
+            if not hasattr(self, "already_warned"):
+                print(
+                    "Layer may have been offloaded to a different device: ",
+                    "x.device", x.device, "base.device", self.base.weight.device, 
+                    "A.device", self.A.device, "B.device", self.B.device, 
+                    "bias.device", self.bias.device
+                )
+                self.already_warned = True
         xa = x.to(self.A.dtype)
         lora = ((xa @ self.A.T) @ self.B.T) * self.lora_scale
         bias = self.bias * self.lora_scale
