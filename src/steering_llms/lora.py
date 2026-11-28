@@ -45,7 +45,7 @@ class LoRATweak(nn.Module):
         r, alpha:   rank and LoRA alpha (lora_scale = alpha / r at construction).
     """
 
-    def __init__(self, base, bias=None, r=8, alpha=8, compute_dtype=torch.bfloat16):
+    def __init__(self, base, bias=None, r=8, alpha=8, compute_dtype=torch.bfloat16, normalize_lengths=False):
         super().__init__()
         self.base = base
         self.r, self.alpha = r, alpha
@@ -58,6 +58,7 @@ class LoRATweak(nn.Module):
         self.B = nn.Parameter(torch.zeros(d_out, r, dtype=compute_dtype, device=dev))
         b = torch.zeros(d_out, dtype=torch.float32, device=dev) if bias is None else bias
         self.bias = nn.Parameter(b.to(device=dev, dtype=compute_dtype).clone())
+        self.normalize_lengths = normalize_lengths
 
     def forward(self, x):
         out = self.base(x)
@@ -77,7 +78,13 @@ class LoRATweak(nn.Module):
         xa = x.to(self.A.dtype)
         lora = ((xa @ self.A.T) @ self.B.T) * self.lora_scale
         bias = self.bias * self.lora_scale
-        return out + lora.to(out.dtype) + bias.to(out.dtype)
+        steered = out + lora.to(out.dtype) + bias.to(out.dtype)
+        if self.normalize_lengths:
+            norm_before = out.norm().item()
+            norm_after = steered.norm().item()
+            return steered * norm_before / norm_after
+        else: 
+            return steered
 
     def trainable(self, mode="lora"):
         """'lora' -> [A, B]; 'bias' -> [bias]; 'both' -> all three; 'none' -> []."""
