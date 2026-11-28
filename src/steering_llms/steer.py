@@ -248,6 +248,20 @@ class SteeredModel:
                     self.layers[L].mlp.down_proj = w.base
                     del self.tweaks[L]
 
+    # ---- gated steering/ablation -----------------------------------------------------
+
+
+    def amplify(self, L, direction, amount=1.0, push=None):
+        if L not in self.tweaks:
+            self.wrap(L, r=1)   # r=1 is a placeholder; gate is what matters
+        w = self.tweaks[L]
+        d = direction.to(w.gateA.device, w.gateA.dtype)
+        p = (push if push is not None else direction).to(w.gateB.device, w.gateB.dtype)
+        g = d / (d @ d)                                  # [d_out], normalized
+        w.gateA = nn.Parameter(torch.cat([w.gateA.data, g[None, :]], dim=0))
+        w.gateB = nn.Parameter(torch.cat([w.gateB.data, (amount * p)[:, None]], dim=1))
+        #w.r_g = w.gateA.shape[0]
+
 
     # import torch
     # import torch.nn as nn

@@ -58,6 +58,8 @@ class LoRATweak(nn.Module):
         self.B = nn.Parameter(torch.zeros(d_out, r, dtype=compute_dtype, device=dev))
         b = torch.zeros(d_out, dtype=torch.float32, device=dev) if bias is None else bias
         self.bias = nn.Parameter(b.to(device=dev, dtype=compute_dtype).clone())
+        self.gateA = nn.Parameter(torch.zeros(0, d_out, dtype=compute_dtype, device=dev))
+        self.gateB = nn.Parameter(torch.zeros(d_out, 0, dtype=compute_dtype, device=dev))
 
     def forward(self, x):
         out = self.base(x)
@@ -66,6 +68,8 @@ class LoRATweak(nn.Module):
             self.A.data = self.A.data.to(x.device)
             self.B.data = self.B.data.to(x.device)
             self.bias.data = self.bias.data.to(x.device)
+            self.gateA.data = self.gateA.data.to(x.device)
+            self.gateB.data = self.gateB.data.to(x.device)
             if not hasattr(self, "already_warned"):
                 print(
                     "Layer may have been offloaded to a different device: ",
@@ -77,6 +81,11 @@ class LoRATweak(nn.Module):
         xa = x.to(self.A.dtype)
         lora = ((xa @ self.A.T) @ self.B.T) * self.lora_scale
         bias = self.bias * self.lora_scale
+        if self.gateA.shape[0] > 0:
+            oa = out.to(self.gateA.dtype)
+            #print(f"[{oa @ self.gateA.T}]")
+            gate = (oa @ self.gateA.T) @ self.gateB.T
+            out = out + gate.to(out.dtype)
         return out + lora.to(out.dtype) + bias.to(out.dtype)
 
     def trainable(self, mode="lora"):
